@@ -1,4 +1,4 @@
-# STRIDER MPC (MuJoCo + ACADOS NMPC + Geometric Control)
+# STRIDER
 
 가변형상(모핑) 쿼드로터 **STRIDER/JellyFish** 모델을 MuJoCo에서 시뮬레이션하고,
 - C++ 실시간 **Geometric(SE(3)) Controller**(+ DoB/CoM 추정/할당)
