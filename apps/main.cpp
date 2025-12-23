@@ -3,9 +3,8 @@
 #include "flight_control.hpp"
 #include "utils.hpp"
 
-#include <mach-o/dyld.h>
-#include <filesystem>
 #include <thread>
+#include <condition_variable>
 #include <csignal>
 #include <pybind11/embed.h>
 
@@ -29,12 +28,9 @@ int main() {
   // Load MuJoCo model
   std::string xml_path;
   {
-    uint32_t size = 0;
-    _NSGetExecutablePath(nullptr, &size);
-    std::string buf(size, '\0');
-    if (_NSGetExecutablePath(buf.data(), &size) != 0) {return 1;}
-    std::filesystem::path exe  = std::filesystem::weakly_canonical(buf.c_str());
-    std::filesystem::path root = exe.parent_path().parent_path();
+    const std::filesystem::path exe = get_executable_path();
+    if (exe.empty()) return 1;
+    const std::filesystem::path root = exe.parent_path().parent_path();
     xml_path = (root / "resources" / "mujoco" / "scene.xml").string();
   }
 

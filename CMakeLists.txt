@@ -34,12 +34,16 @@ execute_process(
   COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
   OUTPUT_VARIABLE _PYBIND11_CMAKEDIR
   OUTPUT_STRIP_TRAILING_WHITESPACE
-  ERROR_QUIET
 )
-if(_PYBIND11_CMAKEDIR)
-  list(APPEND CMAKE_PREFIX_PATH "${_PYBIND11_CMAKEDIR}")
+
+if(NOT _PYBIND11_CMAKEDIR)
+  message(FATAL_ERROR "pybind11 not found in this Python env (python -m pybind11 --cmakedir failed)")
 endif()
-find_package(pybind11 CONFIG REQUIRED)
+
+find_package(pybind11 CONFIG REQUIRED
+  PATHS "${_PYBIND11_CMAKEDIR}"
+  NO_DEFAULT_PATH
+)
 
 # -------------------------
 # MuJoCo (from Python package)

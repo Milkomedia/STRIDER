@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 
+#include <chrono>
 #include <Eigen/Dense>
 #include <mujoco/mujoco.h>
 

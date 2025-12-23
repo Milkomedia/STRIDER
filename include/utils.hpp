@@ -1,5 +1,14 @@
 #include "params.hpp"
 
+#include <filesystem>
+#include <string>
+
+#if defined(__APPLE__)
+  #include <mach-o/dyld.h>
+#elif defined(__linux__)
+  #include <unistd.h>
+#endif
+
 struct SimStae { // use for copy snapshot in thread lock
   double qpos_xyz[3];
   double quat_wxyz[4];
@@ -157,4 +166,22 @@ static inline void FK(const double q[20], Eigen::Vector3d& bpcot) {
     bpcot += T_i.block<3, 1>(0, 3);
   }
   bpcot *= 0.25;
+}
+
+inline std::filesystem::path get_executable_path() {
+#if defined(__APPLE__)
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  std::string buf(size, '\0');
+  if (_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+  return std::filesystem::weakly_canonical(buf.c_str());
+#elif defined(__linux__)
+  char buf[4096];
+  const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n <= 0) return {};
+  buf[n] = '\0';
+  return std::filesystem::weakly_canonical(buf);
+#else
+  return {};
+#endif
 }
