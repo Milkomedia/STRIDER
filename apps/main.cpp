@@ -1,0 +1,326 @@
+#include "mj_viewer_helper.hpp"
+#include "mpc_wrapper.hpp"
+#include "flight_control.hpp"
+#include "utils.hpp"
+
+#include <mach-o/dyld.h>
+#include <filesystem>
+#include <thread>
+#include <csignal>
+#include <pybind11/embed.h>
+
+static std::atomic<bool> g_stop{false};
+static void sigint_handler(int) {g_stop.store(true);}
+
+std::mutex scene_mtx;
+static double g_pos_des[3] = {0.0, 0.0, 0.0};  // desired point for viewer
+static double g_pos_cur[3] = {0.0, 0.0, 0.0};  // current point for viewer
+static std::atomic<bool> g_mpc_activated{false};
+
+static std::mutex mpc_mtx;
+static std::condition_variable mpc_cv;
+static strider_mpc::MPCInput g_mpc_input;
+static strider_mpc::MPCOutput g_mpc_output;
+
+// ===== Main =====
+int main() {
+  std::signal(SIGINT, sigint_handler); // SIGINT handler(ctrl+C)
+
+  // Load MuJoCo model
+  std::string xml_path;
+  {
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buf(size, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) {return 1;}
+    std::filesystem::path exe  = std::filesystem::weakly_canonical(buf.c_str());
+    std::filesystem::path root = exe.parent_path().parent_path();
+    xml_path = (root / "resources" / "mujoco" / "scene.xml").string();
+  }
+
+  char error_[1024] = {0};
+  mjModel* m = mj_loadXML(xml_path.c_str(), nullptr, error_, sizeof(error_));
+  mjData*  d = mj_makeData(m);
+  m->opt.timestep = param::SIM_DT;
+
+  // ---------------- [ MPC thread ] ----------------
+  std::thread th_mpc([&]() {
+
+    pybind11::scoped_interpreter py_guard{false};
+    strider_mpc::acados_wrapper mpc; // compile acados before start.
+    std::printf("\n\n ||----------------------------------||\n ||       Acados compile done.       ||\n || press the [space] to MPC on/off. ||\n ||----------------------------------||\n\n\n");
+
+    while (!g_stop.load()) {
+      strider_mpc::MPCInput in_local;
+      // std::printf(" [mpc]->waiting   ");
+      {
+        std::unique_lock<std::mutex> lk(mpc_mtx);
+        mpc_cv.wait(lk, [&]{
+          if (g_stop.load()) return true;
+          if (!g_mpc_activated.load(std::memory_order_relaxed)) return false;
+          return g_mpc_input.has;
+        });
+        if (g_stop.load()) break;
+        if (g_mpc_input.has == true) {
+          in_local = g_mpc_input;
+          g_mpc_input.has = false;
+        }
+      }
+
+      strider_mpc::MPCOutput out_local;
+      try { out_local = mpc.compute(in_local); }
+      catch (const std::exception&) { out_local.solve_ms = 0.0; out_local.state = 99; }
+      // std::printf("[mpc]->solved:%f  ", out_local.solve_ms);
+
+      {
+        std::lock_guard<std::mutex> lk(mpc_mtx);
+        g_mpc_output = out_local;
+        g_mpc_output.t = in_local.t;
+        g_mpc_output.key = in_local.key;
+        g_mpc_output.has = true;
+      }
+    }
+  });
+
+  // -------------- [ Control thread ] --------------
+  std::thread th_ctrl([&]() {
+    FC::ControllerGeom ctrl;
+    FC::ControlInput ctrl_input{};
+    FC::ControlOutput ctrl_output{};
+    ctrl.set_mode(0);  // 0->conventional / 1->dob / 2->com
+
+    // --- parameters ---
+    Eigen::Vector3d bPcot_des(0.0, 0.0, 0.2); // [m]
+    Eigen::Matrix3d cotRb_des = Eigen::Matrix3d::Identity(); // SO3
+    Eigen::Vector3d cotPc_hat = Eigen::Vector3d::Zero(); // [m]
+    bool mpc_in_solving = false;
+    uint32_t mpc_key = 1;
+    
+    // --- time scope ---
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point next_tick = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point next_mpc_tick = std::chrono::steady_clock::now();
+    const std::chrono::steady_clock::duration ctrl_period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(param::CTRL_DT));
+    const double steps_per_ctrl = param::SIM_HZ / param::CTRL_HZ;
+    double substep_accum = 0.0;
+
+    { // Model warm-up
+      double arm_angles[20]; // Initial arm joint angles
+      Eigen::Vector4d tvc_angle = Eigen::Vector4d::Zero();
+      IK(bPcot_des, cotRb_des, tvc_angle, param::L_DIST, arm_angles);
+      {
+        std::lock_guard<std::mutex> scene_lk(scene_mtx);
+        // spawn and 1 second do nothing
+        for (int k = 0; k < static_cast<int>(param::SIM_HZ); ++k) {
+          for (int i = 0; i < 8 && i < m->nu; ++i) {d->ctrl[i] = 0.0;}
+          for (int i = 0; i < 20 && (8 + i) < m->nu; ++i) {d->ctrl[8 + i] = arm_angles[i];}
+          mj_step(m, d);
+        }
+      }
+    }
+
+    while (!g_stop.load()) {
+      // --- time count ---
+      std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+      const double elapsed_double = std::chrono::duration<double>(now - t0).count();
+
+      SimStae s;
+      {
+        std::lock_guard<std::mutex> scene_lk(scene_mtx);
+        s.qpos_xyz[0]  = d->qpos[0]; s.qpos_xyz[1]  = d->qpos[1]; s.qpos_xyz[2]  = d->qpos[2];
+        s.quat_wxyz[0] = d->qpos[3]; s.quat_wxyz[1] = d->qpos[4]; s.quat_wxyz[2] = d->qpos[5]; s.quat_wxyz[3] = d->qpos[6];
+        s.qvel_lin[0]  = d->qvel[0]; s.qvel_lin[1]  = d->qvel[1]; s.qvel_lin[2]  = d->qvel[2];
+        s.qvel_ang[0]  = d->qvel[3]; s.qvel_ang[1]  = d->qvel[4]; s.qvel_ang[2]  = d->qvel[5];
+        s.qacc_lin[0]  = d->qacc[0]; s.qacc_lin[1]  = d->qacc[1]; s.qacc_lin[2]  = d->qacc[2];
+        for (int i = 0; i < 20; ++i) s.arm_q[i] = d->qpos[7 + i];
+      }
+
+      // --- calculate body -> cot relative pos/heading ---
+      Eigen::Vector3d cur_bPcot;
+      FK(s.arm_q, cur_bPcot);
+
+      // --- Feed state to controller (z-up/z-down conversion) ---
+      Eigen::Vector3d cur_pos_des = fig8_point(elapsed_double);
+      ctrl_input.des_pos << cur_pos_des(0), -cur_pos_des(1), -cur_pos_des(2);
+      ctrl_input.des_heading << 1.0, 0.0, 0.0;
+      ctrl_input.lin_pos  << s.qpos_xyz[0], -s.qpos_xyz[1], -s.qpos_xyz[2];
+      ctrl_input.lin_vel  << s.qvel_lin[0], -s.qvel_lin[1], -s.qvel_lin[2];
+      ctrl_input.lin_acc  << s.qacc_lin[0], -s.qacc_lin[1], -s.qacc_lin[2];
+      ctrl_input.ang_vel  << s.qvel_ang[0], -s.qvel_ang[1], -s.qvel_ang[2];
+      ctrl_input.quat = Eigen::Quaterniond(s.quat_wxyz[0], s.quat_wxyz[1], s.quat_wxyz[2], s.quat_wxyz[3]);
+      for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 5; ++j)
+          ctrl_input.arm_pos(i, j) = s.arm_q[5*i + j];
+
+      ctrl.step(ctrl_input, ctrl_output);
+
+      cotPc_hat = ctrl_output.bpc_hat; // Save estimated CoM in body frame
+      
+      { // MPC send
+        std::lock_guard<std::mutex> mpc_lk(mpc_mtx);
+        if (g_mpc_activated.load(std::memory_order_relaxed)) {
+          if (!mpc_in_solving) {
+            if (now >= next_mpc_tick) {
+              if (!g_mpc_output.has) {
+                // std::printf("[ctrl]->send   ");
+                next_mpc_tick += param::MPC_COMPUTE_DT;
+                mpc_key += 1;
+
+                g_mpc_input.pos_d = fig8_traj(elapsed_double);
+                g_mpc_input.yaw_d.setZero();
+                const Eigen::Vector3d rpy = ctrl_input.quat.toRotationMatrix().eulerAngles(0, 1, 2); // [roll, pitch, yaw]
+                int k = 0; int l = 0;
+                g_mpc_input.u_0(l++) = param::M * param::G;
+                g_mpc_input.x_0(k++) = s.qpos_xyz[0]; g_mpc_input.x_0(k++) = -s.qpos_xyz[1]; g_mpc_input.x_0(k++) = -s.qpos_xyz[2];
+                g_mpc_input.x_0(k++) = s.qvel_lin[0]; g_mpc_input.x_0(k++) = -s.qvel_lin[1]; g_mpc_input.x_0(k++) = -s.qvel_lin[2];
+                g_mpc_input.x_0(k++) = rpy(0); g_mpc_input.x_0(k++) = rpy(1); g_mpc_input.x_0(k++) = rpy(2);
+                g_mpc_input.x_0(k++) = s.qvel_ang[0]; g_mpc_input.x_0(k++) = -s.qvel_ang[1]; g_mpc_input.x_0(k++) = -s.qvel_ang[2];
+                for (int i = 0; i < 4; ++i) {
+                  for (int j = 0; j < 5; ++j) {
+                    g_mpc_input.x_0(k++) = s.arm_q[5*i + j];
+                    g_mpc_input.u_0(l++) = s.arm_q[5*i + j];
+                }}
+                g_mpc_input.p << 0.0, 0.0, 0.0,
+                                  1.0, 0.0, 0.0,
+                                  0.0, 1.0, 0.0,
+                                  0.0, 0.0, 1.0,
+                                  0.0, param::L_DIST;
+                g_mpc_input.debug = false;
+                g_mpc_input.t = now;
+                g_mpc_input.key = mpc_key;
+                g_mpc_input.has = true;
+                mpc_cv.notify_one();
+      }}}}}
+      
+      { // MPC get
+        std::lock_guard<std::mutex> mpc_lk(mpc_mtx);
+        if (g_mpc_output.has) {
+          if (g_mpc_output.key == mpc_key) {
+            if (g_mpc_output.state == 0) {
+              if (now >= g_mpc_output.t + param::MPC_COMPUTE_DT) {
+                // std::printf(" [ctrl]->got\n");
+                double q_mpc[20];
+                for (int i = 0; i < 20; ++i) q_mpc[i] = g_mpc_output.u(i + 1);
+                FK(q_mpc, bPcot_des); // update bPcot_des
+                g_mpc_output.has = false;
+              }
+              else { next_mpc_tick = now; } // timeout
+      }}}}
+
+      // --- IK  ---
+      double q_d[20]; // resolve mpc output to q_d
+      IK(bPcot_des, cotRb_des, ctrl_output.tilt_rad, param::L_DIST, q_d);
+
+      // ------ (PLANT) ------------------------------------------------------------------------------------
+      
+      // --- pwm -> thrust & torque ---
+      const Eigen::Vector4d F = param::PWM_A * ctrl_output.pwm.array().square() + param::PWM_B;
+      const Eigen::Map<const Eigen::Vector4d> ROTOR_DIR(param::rotor_dir);
+      const Eigen::Vector4d Tau = (param::PWM_ZETA * F.array() * ROTOR_DIR.array()).matrix();
+
+
+      // --- Step simulation at SIM_HZ using zero-order hold for control ---
+      substep_accum += steps_per_ctrl;
+      int n_sub = static_cast<int>(substep_accum);
+      substep_accum -= n_sub;
+
+      {
+        std::lock_guard<std::mutex> scene_lk(scene_mtx);
+
+        // save desired/current positions for GUI
+        g_pos_cur[0]=d->qpos[0]; g_pos_des[0]=cur_pos_des(0);
+        g_pos_cur[1]=d->qpos[1]; g_pos_des[1]=cur_pos_des(1);
+        g_pos_cur[2]=d->qpos[2]; g_pos_des[2]=cur_pos_des(2);
+
+        // Apply controls to MuJoCo
+        Eigen::Map<Eigen::Matrix<mjtNum,4,1>>(d->ctrl) = F.cast<mjtNum>();
+        Eigen::Map<Eigen::Matrix<mjtNum,4,1>>(d->ctrl + 4) = Tau.cast<mjtNum>();
+        for (int i = 0; i < 20; ++i) d->ctrl[8 + i] = q_d[i];
+
+        for (int s = 0; s < n_sub; ++s) {mj_step(m, d);}
+      }
+
+      // delay for real-time view
+      const auto now_ = std::chrono::steady_clock::now();
+      if (now_ < next_tick) {std::this_thread::sleep_until(next_tick);}
+      else {
+        const auto lag_us = std::chrono::duration_cast<std::chrono::microseconds>(now_ - next_tick).count();
+        std::printf("! sim delayed: [%lld]us.\n", static_cast<long long>(lag_us));
+      }
+      next_tick += ctrl_period;
+    }
+  });
+
+  // -------- [ Viewer thread (main thread) ] --------
+  {
+    mj_viewer::ViewerCtx v;
+    mj_viewer::viewer_init(v, m);
+    v.mpc_activated = &g_mpc_activated;
+
+    std::deque<std::pair<double, Eigen::Vector3d>> path;
+    std::deque<std::pair<double, Eigen::Vector3d>> dpath;
+    std::chrono::steady_clock::time_point tv0 = std::chrono::steady_clock::now();
+
+    while (!g_stop.load() && !glfwWindowShouldClose(v.window)) {
+      std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+      Eigen::Vector3d pnow;
+      Eigen::Vector3d pdes;
+      { // MuJoCo Veiwer
+        std::lock_guard<std::mutex> scene_lk(scene_mtx);
+        mjv_updateScene(m, d, &v.opt, &v.pert, &v.cam, mjCAT_ALL, &v.scn);
+
+        pnow(0)=g_pos_cur[0], pnow(1)=g_pos_cur[1], pnow(2)=g_pos_cur[2];
+        pdes(0)=g_pos_des[0], pdes(1)=g_pos_des[1], pdes(2)=g_pos_des[2];
+      }
+
+      const double tv = std::chrono::duration<double>(now - tv0).count();
+
+      // draw current position path
+      path.emplace_back(tv, pnow);
+      while (!path.empty() && (tv - path.front().first > param::PATH_SEC)) {path.pop_front();}
+      for (size_t i = 1; i < path.size(); ++i) {
+        const auto& a = path[i - 1].second;
+        const auto& b = path[i].second;
+        double p0[3] = {a.x(), a.y(), a.z()};
+        double p1[3] = {b.x(), b.y(), b.z()};
+        mj_viewer::add_capsule_segment(&v.scn, p0, p1, param::SIZE_PATH, param::RGBA_PATH);
+      }
+
+      // draw desired position path
+      dpath.emplace_back(tv, pdes);
+      while (!dpath.empty() && (tv - dpath.front().first > param::PATH_SEC)) {dpath.pop_front();}
+      for (size_t i = 1; i < dpath.size(); ++i) {
+        const auto& a = dpath[i - 1].second;
+        const auto& b = dpath[i].second;
+        double p0[3] = {a.x(), a.y(), a.z()};
+        double p1[3] = {b.x(), b.y(), b.z()};
+        mj_viewer::add_capsule_segment(&v.scn, p0, p1, param::SIZE_PATH, param::RGBA_DPATH);
+      }
+
+      // draw current position marker
+      double l_pos_des[3] = {pdes.x(), pdes.y(), pdes.z()};
+      mj_viewer::add_sphere_marker(&v.scn, l_pos_des, param::SIZE_DOT, param::RGBA_DOT);
+
+      // Render
+      mjrRect viewport = {0, 0, 0, 0};
+      glfwGetFramebufferSize(v.window, &viewport.width, &viewport.height);
+      mjr_render(viewport, &v.scn, &v.con);
+      glfwSwapBuffers(v.window);
+      glfwPollEvents();
+      std::this_thread::sleep_until(now + param::VIEWER_DT);
+    }
+    
+    mj_viewer::viewer_close(v);
+  }
+
+  g_stop.store(true);
+  mpc_cv.notify_all();
+
+  if (th_ctrl.joinable()) th_ctrl.join();
+  if (th_mpc.joinable())  th_mpc.join();
+
+  mj_deleteData(d);
+  mj_deleteModel(m);
+  return 0;
+}
