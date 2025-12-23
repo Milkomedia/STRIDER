@@ -1,0 +1,19 @@
+# build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# python
+__pycache__/
+*.pyc
+
+# Acados
+generated/
+*.json
+
+# macOS
+.DS_Store
+Icon?
