@@ -139,12 +139,12 @@ endif()
 # modules/geometry_ctrl
 # ============================================================
 add_library(geometry_ctrl STATIC
-  modules/geometry_ctrl/src/fdcl_control.cpp
-  modules/geometry_ctrl/src/fdcl_matrix_utils.cpp
+  resources/geometry_ctrl/src/fdcl_control.cpp
+  resources/geometry_ctrl/src/fdcl_matrix_utils.cpp
 )
 
 target_include_directories(geometry_ctrl PUBLIC
-  ${CMAKE_SOURCE_DIR}/modules/geometry_ctrl/include
+  ${CMAKE_SOURCE_DIR}/resources/geometry_ctrl/include
   ${CMAKE_SOURCE_DIR}/include
   ${MUJOCO_INCLUDE_DIR}  # for <mujoco/mujoco.h>
 )
@@ -164,7 +164,7 @@ add_library(strider_core STATIC
 
 target_include_directories(strider_core PUBLIC
   ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/modules/geometry_ctrl/include
+  ${CMAKE_SOURCE_DIR}/resources/geometry_ctrl/include
   ${MUJOCO_INCLUDE_DIR}
 )
 
