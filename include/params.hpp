@@ -88,7 +88,6 @@ static constexpr double MPC_COMPUTE_DT_D = 0.05; // [sec]
 static const std::chrono::steady_clock::duration MPC_MODEL_DT = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(MPC_MODEL_DT_D));
 static const std::chrono::steady_clock::duration MPC_COMPUTE_DT = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(MPC_COMPUTE_DT_D));
 
-
 constexpr std::size_t N_STEPS  = 50;
 constexpr std::size_t NX       = 32;
 constexpr std::size_t NU       = 21;

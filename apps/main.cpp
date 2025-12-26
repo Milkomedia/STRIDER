@@ -65,7 +65,7 @@ int main() {
 
       strider_mpc::MPCOutput out_local;
       try { out_local = mpc.compute(in_local); }
-      catch (const std::exception&) { out_local.solve_ms = 0.0; out_local.state = 99; }
+      catch (const std::exception&) { out_local.solve_ms = 0.0; out_local.state = 99; std::printf("OH SHIT");}
       // std::printf("[mpc]->solved:%f  ", out_local.solve_ms);
 
       {
@@ -86,7 +86,7 @@ int main() {
     ctrl.set_mode(0);  // 0->conventional / 1->dob / 2->com
 
     // --- parameters ---
-    Eigen::Vector3d bPcot_des(0.0, 0.0, 0.2); // [m]
+    Eigen::Vector3d bPcot_des(0.0, 0.0, 0.1); // [m]
     Eigen::Matrix3d cotRb_des = Eigen::Matrix3d::Identity(); // SO3
     Eigen::Vector3d cotPc_hat = Eigen::Vector3d::Zero(); // [m]
     bool mpc_in_solving = false;
@@ -167,10 +167,10 @@ int main() {
                 const Eigen::Vector3d rpy = ctrl_input.quat.toRotationMatrix().eulerAngles(0, 1, 2); // [roll, pitch, yaw]
                 int k = 0; int l = 0;
                 g_mpc_input.u_0(l++) = param::M * param::G;
-                g_mpc_input.x_0(k++) = s.qpos_xyz[0]; g_mpc_input.x_0(k++) = -s.qpos_xyz[1]; g_mpc_input.x_0(k++) = -s.qpos_xyz[2];
-                g_mpc_input.x_0(k++) = s.qvel_lin[0]; g_mpc_input.x_0(k++) = -s.qvel_lin[1]; g_mpc_input.x_0(k++) = -s.qvel_lin[2];
+                g_mpc_input.x_0(k++) = s.qpos_xyz[0]; g_mpc_input.x_0(k++) = s.qpos_xyz[1]; g_mpc_input.x_0(k++) = s.qpos_xyz[2];
+                g_mpc_input.x_0(k++) = s.qvel_lin[0]; g_mpc_input.x_0(k++) = s.qvel_lin[1]; g_mpc_input.x_0(k++) = s.qvel_lin[2];
                 g_mpc_input.x_0(k++) = rpy(0); g_mpc_input.x_0(k++) = rpy(1); g_mpc_input.x_0(k++) = rpy(2);
-                g_mpc_input.x_0(k++) = s.qvel_ang[0]; g_mpc_input.x_0(k++) = -s.qvel_ang[1]; g_mpc_input.x_0(k++) = -s.qvel_ang[2];
+                g_mpc_input.x_0(k++) = s.qvel_ang[0]; g_mpc_input.x_0(k++) = s.qvel_ang[1]; g_mpc_input.x_0(k++) = s.qvel_ang[2];
                 for (int i = 0; i < 4; ++i) {
                   for (int j = 0; j < 5; ++j) {
                     g_mpc_input.x_0(k++) = s.arm_q[5*i + j];
@@ -181,7 +181,7 @@ int main() {
                                   0.0, 1.0, 0.0,
                                   0.0, 0.0, 1.0,
                                   0.0, param::L_DIST;
-                g_mpc_input.debug = false;
+                g_mpc_input.debug = true;
                 g_mpc_input.t = now;
                 g_mpc_input.key = mpc_key;
                 g_mpc_input.has = true;
@@ -197,7 +197,7 @@ int main() {
                 // std::printf(" [ctrl]->got\n");
                 double q_mpc[20];
                 for (int i = 0; i < 20; ++i) q_mpc[i] = g_mpc_output.u(i + 1);
-                FK(q_mpc, bPcot_des); // update bPcot_des
+                // FK(q_mpc, bPcot_des); // update bPcot_des
                 g_mpc_output.has = false;
               }
               else { next_mpc_tick = now; } // timeout
